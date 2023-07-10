@@ -24,10 +24,7 @@ from MODEL.BertModelForFeedBack import BERTMODEL_LIST
 from transformers import BertTokenizer
 import warnings
 from collections import defaultdict, Counter
-warnings.filterwarnings("ignore")
-'''
-bert feedback predict
-'''
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--pretrain_model', default='../MODEL/bert-base-uncased',
                         help='Pretrain model weight')
@@ -64,7 +61,6 @@ parser.add_argument("--extend_prefix", default='_beam2', type=str)
 # parser.add_argument('--load_best_model_at_end', default=True)
 args = parser.parse_args()
 print(args.extend_data, args.output_dir)
-args.output_dir = f'{args.output_dir}/feedback_model'
 
 strateges = get_stratege('../new_strategy.json', norm=True)
 stratege2id = {v: k for k, v in enumerate(strateges)}
@@ -181,31 +177,107 @@ def get_optimer(model, second_parameter, train_parser):
     return optimizer
 
 
-def train():
-    training_args = HfArgumentParser(TrainingArguments).parse_dict(vars(args))[0]
-    optimer = get_optimer(model, sencond_parameters,training_args)
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics_with_bart_result,
-        train_dataset=train_set,
-        eval_dataset=eval_set,
-        optimizers=(optimer,None),
-    )
+def train(self,epochs):
+    for epoch in range(epochs):
+        dataset = TensorDataset(torch.FloatTensor(self.replay_buffer))
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        for batch in dataloader:
+            states = batch
+            dones = batch[:, 8].to(self.device)
 
-    # Training
-    train_result = trainer.train()
-    trainer.save_model()
-    predict_metric = trainer.evaluate(test_set, metric_key_prefix="predict")
+            q_values = self.q_network(torch.cat([states, intentions.unsqueeze(-1), emotions.unsqueeze(-1)], dim=-1)).gather(1,
+                                                                                                                            actions.unsqueeze(
+                                                                                                                                1))
+            next_q_values = self.target_network(
+                torch.cat([next_states, next_intentions.unsqueeze(-1), next_emotions.unsqueeze(-1)], dim=-1)).max(1)[0].detach()
 
-    print(predict_metric)
-    metrics = train_result.metrics
-    trainer.log_metrics("train", metrics)
-    trainer.save_metrics("train", metrics)
-    trainer.save_state()
+            targets = rewards + (1 - dones) * self.gamma * next_q_values
 
+            loss = self.loss_function(q_values, targets.unsqueeze(1))
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+    self.steps += 1
+    if self.steps % self.update_interval == 0:
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+
+def train_hgan(self, dataset, tokenizer, model):
+    hgan = HierarchicalGAN(self.input_dim, self.hidden_dim, self.num_intentions, self.num_emotions, tokenizer, model,
+                           device=self.device)
+
+    for epoch in range(hgan.num_epochs):
+        hgan.train()
+        for batch in dataset:
+            batch = batch.to(self.device)
+            states = batch[:, :self.input_dim]
+            intentions = batch[:, self.input_dim:self.input_dim + self.num_intentions]
+            emotions = batch[:,
+                       self.input_dim + self.num_intentions:self.input_dim + self.num_intentions + self.num_emotions]
+            inputs = batch[:, -1]
+            hgan.train_batch(states, intentions, emotions, inputs)
+
+        hgan.eval()
+        with torch.no_grad():
+            for batch in dataset:
+                batch = batch.to(self.device)
+                states = batch[:, :self.input_dim]
+                intentions = batch[:, self.input_dim:self.input_dim + self.num_intentions]
+                emotions = batch[:,
+                           self.input_dim + self.num_intentions:self.input_dim + self.num_intentions + self.num_emotions]
+                inputs = batch[:, -1]
+                hgan.eval_batch(states, intentions, emotions, inputs)
+
+
+def train_dq_hgan(self, num_episodes, max_episode_length, epsilon_start, epsilon_final, epsilon_decay, bert_model_name,
+                  gpt2_model_name):
+    bert_tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+    gpt2_tokenizer = GPT2Tokenizer.from_pretrained(gpt2_model_name)
+    gpt2_model = GPT2LMHeadModel.from_pretrained(gpt2_model_name).to(self.device)
+    self.train_hgan(self.replay_buffer, bert_tokenizer, gpt2_model)
+
+    epsilon = epsilon_start
+    for episode in range(num_episodes):
+        state = torch.zeros(self.input_dim).to(self.device)
+        intention = torch.zeros(self.num_intentions).long().to(self.device)
+        emotion = torch.zeros(self.num_emotions).long().to(self.device)
+        cum_reward = 0
+        for t in range(max_episode_length):
+            action = self.select_action(state, intention, emotion, epsilon)
+            next_state, reward, done, next_intention, next_emotion = self.env.step(action)
+
+            self.add_to_buffer(state, intention, emotion, action, reward, next_state, next_intention, next_emotion,
+                               done)
+            self.update()
+
+            state = next_state
+            intention = next_intention
+            emotion = next_emotion
+            cum_reward += reward
+
+            if done:
+                break
+
+        epsilon = max(epsilon_final, epsilon_decay * epsilon)
+
+        if episode % 10 == 0:
+            print(f"Episode {episode}: Cumulative reward = {cum_reward}")
+
+        if episode % 100 == 0:
+            self.train_hgan(self.replay_buffer, bert_tokenizer, gpt2_model)
+
+def generate_response(state, intention, emotion, dqn, hgan, bert_tokenizer, gpt2_tokenizer, gpt2_model, max_length=50):
+    with torch.no_grad():
+        inputs = hgan.generate(state, intention, emotion, bert_tokenizer, gpt2_tokenizer, gpt2_model, max_length=max_length)
+        inputs = torch.FloatTensor(inputs).to(dqn.device)
+        q_values = dqn.q_network(torch.cat([state, intention, emotion], dim=-1).to(dqn.device) + inputs)
+        action = torch.argmax(q_values).item()
+        response = hgan.generate(state, intention, action, bert_tokenizer, gpt2_tokenizer, gpt2_model, max_length=max_length)
+        return response
 if __name__ == '__main__':
     os.environ["WANDB_DISABLED"] = "true"
     fix_random(args.seed)
     train()
+    # generate_response(state, intention, emotion, dqn, hgan, bert_tokenizer, gpt2_tokenizer, gpt2_model)

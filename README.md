@@ -6,7 +6,7 @@ This repository contains the codes and data used in our  paper: DQ-HGAN: A Heter
 Refer to new_torch15.yml to set up the environment. You could use the following command.
 
 ```bash
-conda env create -f new_torch15.yml 
+conda env create -f requirements.yml 
 ```
 
 ### Data
@@ -42,7 +42,7 @@ CUDA_VISIBLE_DEVICES=0,1 python generate_strategy_test.py --data_type=3 --model_
 3. Train the feedback predictor. The model will be saved in ./final_output/feedback_model.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,2 python feedback_model_train.py
+CUDA_VISIBLE_DEVICES=0,2 python train.py
 ```
 
 4. Use our proposed lookahead strategy planning method to predict the strategy for the upcoming turn. The output will be saved in ./final_data/multiesc_predicted_strategy.pk.
